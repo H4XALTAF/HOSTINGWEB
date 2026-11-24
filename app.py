@@ -4,6 +4,8 @@ import secrets
 import threading
 from datetime import datetime, timezone
 from functools import wraps
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 from flask import (
     Flask, render_template, request, redirect,
@@ -29,7 +31,6 @@ app.config.update(
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.path.join(BASE_DIR, "data.json")
 TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
 
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
@@ -97,31 +98,43 @@ DEFAULT_DATA = {
 
 
 # ==========================================
-# JSON DATABASE
+# POSTGRESQL DATABASE (SUPABASE)
 # ==========================================
 
+def get_db():
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url and db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(db_url)
+
+
 def save_data(data):
-    temp_file = DATA_FILE + ".tmp"
-
-    with data_lock:
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-
-        os.replace(temp_file, DATA_FILE)
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS site_data (id INT PRIMARY KEY, data JSONB);")
+        cur.execute("""
+            INSERT INTO site_data (id, data) VALUES (1, %s)
+            ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data;
+        """, (json.dumps(data),))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("Save Error:", e)
 
 
 def load_data():
-    with data_lock:
-        if not os.path.exists(DATA_FILE):
-            data = DEFAULT_DATA.copy()
-            data["created_at"] = datetime.now(timezone.utc).isoformat()
-            save_data(data)
-            return data
-
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("CREATE TABLE IF NOT EXISTS site_data (id INT PRIMARY KEY, data JSONB);")
+        cur.execute("SELECT data FROM site_data WHERE id = 1;")
+        row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        
+        if row:
+            data = row['data']
             # Restore missing default settings after updates
             for key, value in DEFAULT_DATA.items():
                 if key not in data:
@@ -138,11 +151,15 @@ def load_data():
                 data["settings"]["content"].setdefault(key, value)
 
             return data
+        else:
+            data = DEFAULT_DATA.copy()
+            data["created_at"] = datetime.now(timezone.utc).isoformat()
+            save_data(data)
+            return data
 
-        except (json.JSONDecodeError, OSError):
-            raise RuntimeError(
-                "data.json is damaged or unreadable. Restore a valid backup."
-            )
+    except Exception as e:
+        print("DB Load Error:", e)
+        return DEFAULT_DATA
 
 
 def update_data(callback):
